@@ -34,6 +34,8 @@ module PatternTrie = struct
 
   type 'a t = 'a node
 
+  exception IncompatibleWildcard
+
   let empty = { parsers = []; children = KeyMap.empty; capture = None; wildcard = false }
 
   let feed_params t params =
@@ -57,10 +59,12 @@ module PatternTrie = struct
   let add k v t =
     let rec aux k t =
       match k, t with
-      | [], ({ parsers = x; _ } as n) -> { n with parsers = v :: x }
-      | x :: r, ({ children; capture; _ } as n) ->
+      | [], ({ parsers = x; wildcard; _ } as n) ->
+        if wildcard then raise IncompatibleWildcard else { n with parsers = v :: x }
+      | x :: r, ({ parsers; children; capture; wildcard; _ } as n) ->
         (match x with
          | Key.Match w ->
+           if wildcard then raise IncompatibleWildcard;
            let t' =
              match KeyMap.find_opt w children with
              | None -> empty
@@ -69,6 +73,7 @@ module PatternTrie = struct
            let t'' = aux r t' in
            { n with children = KeyMap.add w t'' children }
          | Key.Capture ->
+           if wildcard then raise IncompatibleWildcard;
            let t' =
              match capture with
              | None -> empty
@@ -76,7 +81,10 @@ module PatternTrie = struct
            in
            let t'' = aux r t' in
            { n with capture = Some t'' }
-         | Key.Wildcard -> { n with parsers = v :: n.parsers; wildcard = true })
+         | Key.Wildcard ->
+           if wildcard || (parsers = [] && KeyMap.is_empty children && capture = None)
+           then { n with parsers = v :: parsers; wildcard = true }
+           else raise IncompatibleWildcard)
     in
     aux k t
   ;;
@@ -105,8 +113,7 @@ module PatternTrie = struct
       match t1.wildcard, t2.wildcard with
       | false, false -> false
       | true, true -> true
-      | false, true | true, false ->
-        failwith "Attemp to union wildcard and non-wildcard pattern"
+      | false, true | true, false -> raise IncompatibleWildcard
     in
     { parsers; children; capture; wildcard }
   ;;
@@ -139,11 +146,13 @@ type ('a, 'b) path =
   | Conv : 'c conv * ('a, 'b) path -> ('c -> 'a, 'b) path
 
 type 'b route = Route : ('a, 'c) path * 'a * ('c -> 'b) -> 'b route
-type 'b router = 'b route PatternTrie.t
+type 'b router =
+  | TrieRouter of 'b route PatternTrie.t
+  | UnionRouter of 'b router list
 
 let pattern to_ from_ label r = Conv (conv to_ from_ label, r)
 let custom ~serialize:to_ ~parse:from_ ~label r = Conv (conv to_ from_ label, r)
-let empty_router = PatternTrie.empty
+let empty_router = TrieRouter PatternTrie.empty
 let ( @--> ) r handler = Route (r, handler, fun x -> x)
 let route r handler = Route (r, handler, fun x -> x)
 let s w r = Match (w, r)
@@ -226,22 +235,43 @@ let parse_route path handler params =
   match_target path handler [] params
 ;;
 
-let one_of routes =
-  let routes = List.rev routes in
-  List.fold_left
-    (fun routes (Route (path, _, _) as route) ->
-       let patterns = route_pattern path in
-       PatternTrie.add patterns route routes)
-    empty_router
-    routes
+let router_of_route ((Route (path, _, _)) as route) =
+  TrieRouter (PatternTrie.add (route_pattern path) route PatternTrie.empty)
 ;;
 
-let union = PatternTrie.union
+let union_parts = function
+  | UnionRouter routers -> routers
+  | router -> [ router ]
+;;
 
-let add_route route routes =
-  let (Route (path, _, _)) = route in
+let union first second =
+  match first, second with
+  | (TrieRouter first as left), (TrieRouter second as right) ->
+    (try TrieRouter (PatternTrie.union first second) with
+     | PatternTrie.IncompatibleWildcard -> UnionRouter [ left; right ])
+  | _ -> UnionRouter (union_parts first @ union_parts second)
+;;
+
+let one_of routes =
+  let rec add_routes trie = function
+    | [] -> TrieRouter trie
+    | (Route (path, _, _) as route) :: rest ->
+      (try add_routes (PatternTrie.add (route_pattern path) route trie) rest with
+       | PatternTrie.IncompatibleWildcard ->
+         UnionRouter
+           (List.map router_of_route (List.rev rest)
+            @ [ router_of_route route; TrieRouter trie ]))
+  in
+  add_routes PatternTrie.empty (List.rev routes)
+;;
+
+let add_route ((Route (path, _, _)) as route) router =
   let patterns = route_pattern path in
-  PatternTrie.add patterns route routes
+  match router with
+  | TrieRouter trie ->
+    (try TrieRouter (PatternTrie.add patterns route trie) with
+     | PatternTrie.IncompatibleWildcard -> UnionRouter [ router_of_route route; router ])
+  | UnionRouter routers -> UnionRouter (router_of_route route :: routers)
 ;;
 
 let map f (Route (r, h, g)) = Route (r, h, fun x -> f (g x))
@@ -255,10 +285,19 @@ let rec match_routes target = function
      | MatchWithTrailingSlash r -> MatchWithTrailingSlash (f r))
 ;;
 
-let match' router ~target =
-  let target = Util.split_path target in
-  let routes = PatternTrie.feed_params router target in
-  match_routes target routes
+let rec match_in_router target = function
+  | TrieRouter router -> match_routes target (PatternTrie.feed_params router target)
+  | UnionRouter routers ->
+    let rec first_match = function
+      | [] -> NoMatch
+      | router :: rest ->
+        (match match_in_router target router with
+         | NoMatch -> first_match rest
+         | result -> result)
+    in
+    first_match routers
 ;;
+
+let match' router ~target = match_in_router (Util.split_path target) router ;;
 
 let ( /~ ) m path = m path

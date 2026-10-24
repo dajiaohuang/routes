@@ -109,6 +109,44 @@ let%expect_test "test left biased union" =
   [%expect {| Exact match with result = 10 |}]
 ;;
 
+let%expect_test "wildcard and exact routes keep router order" =
+  let open Routes in
+  let wildcard_route =
+    (s "api" /? wildcard) @--> fun parts -> "wild:" ^ Parts.wildcard_match parts
+  in
+  let exact_route = (s "api" / s "health" /? nil) @--> "exact" in
+  let result router target =
+    match match' router ~target with
+    | FullMatch value -> value
+    | MatchWithTrailingSlash value -> "trailing:" ^ value
+    | NoMatch -> "no-match"
+  in
+  let union_wildcard_first = union (one_of [ wildcard_route ]) (one_of [ exact_route ]) in
+  let union_exact_first = union (one_of [ exact_route ]) (one_of [ wildcard_route ]) in
+  let listed_wildcard_first = one_of [ wildcard_route; exact_route ] in
+  let listed_exact_first = one_of [ exact_route; wildcard_route ] in
+  let added_route_order = one_of [] |> add_route wildcard_route |> add_route exact_route in
+  let print_results label router =
+    printf
+      "%s: health=%s, other=%s\n"
+      label
+      (result router "/api/health")
+      (result router "/api/other")
+  in
+  print_results "union wildcard first" union_wildcard_first;
+  print_results "union exact first" union_exact_first;
+  print_results "one_of wildcard first" listed_wildcard_first;
+  print_results "one_of exact first" listed_exact_first;
+  print_results "add_route newest first" added_route_order;
+  [%expect
+    {|
+    union wildcard first: health=wild:/health, other=wild:/other
+    union exact first: health=exact, other=wild:/other
+    one_of wildcard first: health=wild:/health, other=wild:/other
+    one_of exact first: health=exact, other=wild:/other
+    add_route newest first: health=exact, other=wild:/other |}]
+;;
+
 let%expect_test "test map" =
   let open Routes in
   let route = (s "foo" / int /? nil) @--> fun i -> i in
